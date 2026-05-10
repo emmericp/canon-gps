@@ -1,0 +1,5 @@
+__pycache__
+*.csv
+*.gpx
+*.pcap
+.claude/settings.local.json
