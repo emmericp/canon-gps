@@ -48,6 +48,24 @@ CANON_OP_GetGPSLogData  = 0x91A4  # get binary GPS log data; params=[handle, off
 
 # Canon device property used to negotiate the transfer chunk size
 CANON_PROP_TransferSize = 0xD16E  # value observed in trace: 0x2000 = 8192 bytes
+CANON_PROP_LogInterval  = 0xD14F  # log interval in seconds (enum: 1,5,10,15,30,60,120,300)
+
+# ── PTP standard property operation codes ────────────────────────────────────
+PTP_OP_GetDevicePropDesc  = 0x1014
+PTP_OP_GetDevicePropValue = 0x1015
+PTP_OP_SetDevicePropValue = 0x1016
+
+# ── PTP scalar data-type codes → (struct_fmt, byte_size) ─────────────────────
+_PTP_DTC_FMT: dict[int, tuple[str, int]] = {
+    0x0002: ("<B", 1),   # UINT8
+    0x0003: ("<b", 1),   # INT8
+    0x0004: ("<H", 2),   # UINT16
+    0x0005: ("<h", 2),   # INT16
+    0x0006: ("<I", 4),   # UINT32
+    0x0007: ("<i", 4),   # INT32
+    0x0008: ("<Q", 8),   # UINT64
+    0x0009: ("<q", 8),   # INT64
+}
 
 # ── GPS record format (32 bytes, sync 0x5A...0xA5) ───────────────────────────
 GPS_RECORD_SIZE = 32
@@ -111,6 +129,20 @@ class GPSLogInfo:
     end_time: Optional[datetime.datetime]
 
 
+@dataclass
+class DevicePropDesc:
+    prop_code: int
+    data_type: int
+    writable: bool
+    factory_default: int
+    current_value: int
+    form_flag: int           # 0=none, 1=range, 2=enum
+    enum_values: list[int]   # populated when form_flag==2
+    range_min: Optional[int]
+    range_max: Optional[int]
+    range_step: Optional[int]
+
+
 # ── PTP framing helpers ───────────────────────────────────────────────────────
 
 def build_command(op_code: int, txn_id: int, params: list[int] = ()) -> bytes:
@@ -148,6 +180,47 @@ def parse_data_container(data: bytes) -> tuple[int, bytes]:
     if ctype != PTP_DATA:
         raise RuntimeError(f"Expected DATA container (type 2), got type {ctype}")
     return code, data[12:length]
+
+
+def _prop_value(data: bytes, off: int, data_type: int) -> tuple[int, int]:
+    """Read one scalar PTP property value. Returns (value, next_offset)."""
+    fmt, size = _PTP_DTC_FMT.get(data_type, ("<I", 4))
+    return struct.unpack_from(fmt, data, off)[0], off + size
+
+
+def parse_prop_desc(data: bytes) -> DevicePropDesc:
+    """Parse a PTP GetDevicePropDesc payload into a DevicePropDesc."""
+    off = 0
+    prop_code = struct.unpack_from("<H", data, off)[0]
+    off += 2
+    data_type = struct.unpack_from("<H", data, off)[0]
+    off += 2
+    writable = data[off] == 0x01
+    off += 1
+    factory_default, off = _prop_value(data, off, data_type)
+    current_value, off   = _prop_value(data, off, data_type)
+    form_flag = data[off]
+    off += 1
+
+    enum_values: list[int] = []
+    range_min = range_max = range_step = None
+    if form_flag == 0x01:  # Range form
+        range_min,  off = _prop_value(data, off, data_type)
+        range_max,  off = _prop_value(data, off, data_type)
+        range_step, off = _prop_value(data, off, data_type)
+    elif form_flag == 0x02:  # Enumeration form
+        count = struct.unpack_from("<H", data, off)[0]
+        off += 2
+        for _ in range(count):
+            v, off = _prop_value(data, off, data_type)
+            enum_values.append(v)
+
+    return DevicePropDesc(
+        prop_code=prop_code, data_type=data_type, writable=writable,
+        factory_default=factory_default, current_value=current_value,
+        form_flag=form_flag, enum_values=enum_values,
+        range_min=range_min, range_max=range_max, range_step=range_step,
+    )
 
 
 # ── Low-level USB I/O ─────────────────────────────────────────────────────────
@@ -228,6 +301,22 @@ class PTPDevice:
         else:
             raise RuntimeError(f"Unexpected container type {ctype:#06x}")
 
+    def get_device_prop_desc(self, prop_code: int) -> DevicePropDesc:
+        data, code, _ = self.do_command_data_in(PTP_OP_GetDevicePropDesc, [prop_code])
+        if code != PTP_RC_OK or data is None:
+            raise RuntimeError(f"GetDevicePropDesc(0x{prop_code:04X}) failed: 0x{code:04X}")
+        return parse_prop_desc(data)
+
+    def set_device_prop_value(self, prop_code: int, value: int, data_type: int = 0x0006):
+        fmt, _ = _PTP_DTC_FMT.get(data_type, ("<I", 4))
+        payload = struct.pack(fmt, value)
+        txn = self.send_command(PTP_OP_SetDevicePropValue, [prop_code])
+        self.send_data(PTP_OP_SetDevicePropValue, txn, payload)
+        code, _ = self.read_response()
+        if code != PTP_RC_OK:
+            raise RuntimeError(
+                f"SetDevicePropValue(0x{prop_code:04X}={value}) failed: 0x{code:04X}")
+
     def open_session(self, session_id: int = 1):
         code, _ = self.do_command(PTP_OP_OpenSession, [session_id])
         if code != PTP_RC_OK:
@@ -281,7 +370,7 @@ class PTPDevice:
         as the third parameter to 0x91A4. Uses op 0x1015 which the device treats
         as a GetDevicePropValue-style read for this property.
         """
-        data, code, _ = self.do_command_data_in(0x1015, [CANON_PROP_TransferSize])
+        data, code, _ = self.do_command_data_in(PTP_OP_GetDevicePropValue, [CANON_PROP_TransferSize])
         if code != PTP_RC_OK or not data:
             return 0x2000  # safe fallback matching observed value
         return struct.unpack_from("<I", data, 0)[0]
@@ -363,6 +452,7 @@ class DeviceInfo:
     model: str
     device_version: str   # raw PTP string, e.g. "4-2.0.2"
     serial_number: str
+    device_properties: list[int]  # property codes from DevicePropertiesSupported
 
 
 def _ptp_string(data: bytes, off: int) -> tuple[str, int]:
@@ -380,6 +470,13 @@ def _ptp_array16(data: bytes, off: int) -> int:
     return off + 4 + count * 2
 
 
+def _ptp_array16_values(data: bytes, off: int) -> tuple[list[int], int]:
+    """Read a PTP AUINT16 array. Returns (values, next_offset)."""
+    count = struct.unpack_from("<I", data, off)[0]
+    vals = list(struct.unpack_from(f"<{count}H", data, off + 4))
+    return vals, off + 4 + count * 2
+
+
 def parse_device_info(data: bytes) -> DeviceInfo:
     """Parse PTP GetDeviceInfo payload.
 
@@ -389,20 +486,21 @@ def parse_device_info(data: bytes) -> DeviceInfo:
       DevicePropertiesSupported(AU16) CaptureFormats(AU16) ImageFormats(AU16)
       Manufacturer(str) Model(str) DeviceVersion(str) SerialNumber(str)
     """
-    off = 8                              # skip StandardVersion + VendorExtID + VendorExtVersion
-    _, off  = _ptp_string(data, off)    # VendorExtensionDesc
-    off    += 2                          # FunctionalMode
-    off     = _ptp_array16(data, off)   # OperationsSupported
-    off     = _ptp_array16(data, off)   # EventsSupported
-    off     = _ptp_array16(data, off)   # DevicePropertiesSupported
-    off     = _ptp_array16(data, off)   # CaptureFormats
-    off     = _ptp_array16(data, off)   # ImageFormats
+    off = 8                                          # skip StandardVersion + VendorExtID + VendorExtVersion
+    _, off  = _ptp_string(data, off)                # VendorExtensionDesc
+    off    += 2                                      # FunctionalMode
+    off     = _ptp_array16(data, off)               # OperationsSupported
+    off     = _ptp_array16(data, off)               # EventsSupported
+    props, off = _ptp_array16_values(data, off)     # DevicePropertiesSupported
+    off     = _ptp_array16(data, off)               # CaptureFormats
+    off     = _ptp_array16(data, off)               # ImageFormats
     manufacturer,   off = _ptp_string(data, off)
     model,          off = _ptp_string(data, off)
     device_version, off = _ptp_string(data, off)
     serial_number,  _   = _ptp_string(data, off)
     return DeviceInfo(manufacturer=manufacturer, model=model,
-                      device_version=device_version, serial_number=serial_number)
+                      device_version=device_version, serial_number=serial_number,
+                      device_properties=props)
 
 
 def _firmware_tuple(device_version: str) -> tuple[int, ...]:
@@ -523,6 +621,36 @@ def write_csv(records: list[GPSRecord], path: str, debug: bool = False):
     print(f"Wrote {len(records)} points to {path}")
 
 
+# ── PTP data-type display names ───────────────────────────────────────────────
+_DTC_NAME: dict[int, str] = {
+    0x0002: "UINT8",  0x0003: "INT8",
+    0x0004: "UINT16", 0x0005: "INT16",
+    0x0006: "UINT32", 0x0007: "INT32",
+    0x0008: "UINT64", 0x0009: "INT64",
+    0xFFFF: "UNDEF",  # Canon vendor-specific / unknown; values parsed as UINT32 fallback
+}
+
+def _format_prop_desc(desc: DevicePropDesc) -> str:
+    """One-line summary of a DevicePropDesc for the list command."""
+    type_str = _DTC_NAME.get(desc.data_type, f"0x{desc.data_type:04X}")
+    rw = "rw" if desc.writable else "r-"
+    if desc.form_flag == 0x02:
+        form = "enum=[" + ", ".join(str(v) for v in desc.enum_values) + "]"
+    elif desc.form_flag == 0x01:
+        form = f"range=[{desc.range_min}..{desc.range_max} step {desc.range_step}]"
+    else:
+        form = ""
+    parts = [f"current={desc.current_value}", f"default={desc.factory_default}", form]
+    return f"{type_str:6}  {rw}  " + "  ".join(p for p in parts if p)
+
+
+# ── Known configurable device properties ─────────────────────────────────────
+# (prop_code, human label, unit suffix)
+KNOWN_PROPS: dict[str, tuple[int, str, str]] = {
+    "interval":      (CANON_PROP_LogInterval,  "Log interval",  "s"),
+    "transfer_size": (CANON_PROP_TransferSize, "Transfer size", "B"),
+}
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def find_device(vid: int = CANON_VID, pid: int = GPE2_PID):
@@ -551,6 +679,55 @@ def _output_records(records: list[GPSRecord], stem: str,
         write_gpx(records, f"{output_dir}/{stem}.gpx", track_name=stem)
     elif output_format == "csv":
         write_csv(records, f"{output_dir}/{stem}.csv", debug=debug)
+
+
+def run_config(action: str, prop_name: Optional[str] = None,
+               value: Optional[int] = None, ignore_version: bool = False):
+    dev = find_device()
+    claim_interface(dev)
+    ptp = PTPDevice(dev)
+
+    try:
+        ptp.open_session(1)
+
+        info_data = ptp.get_device_info()
+        dev_info = parse_device_info(info_data)
+        print(f"Device: {dev_info.manufacturer} {dev_info.model}  "
+              f"FW: {dev_info.device_version}  SN: {dev_info.serial_number}")
+        check_firmware(dev_info.device_version, ignore_version)
+
+        if action == "list":
+            for cli_name, (prop_code, label, unit) in KNOWN_PROPS.items():
+                desc = ptp.get_device_prop_desc(prop_code)
+                print(f"{cli_name}: {desc.current_value}{unit}  "
+                      f"(default: {desc.factory_default}{unit})")
+
+        elif action == "get":
+            assert prop_name is not None
+            prop_code, label, unit = KNOWN_PROPS[prop_name]
+            desc = ptp.get_device_prop_desc(prop_code)
+            print(f"{label}: {desc.current_value}{unit}  "
+                  f"(default: {desc.factory_default}{unit})")
+            if desc.enum_values:
+                vals = ", ".join(f"{v}{unit}" for v in sorted(desc.enum_values))
+                print(f"  Allowed: {vals}")
+
+        elif action == "set":
+            assert prop_name is not None and value is not None
+            prop_code, label, unit = KNOWN_PROPS[prop_name]
+            desc = ptp.get_device_prop_desc(prop_code)
+            if not desc.writable:
+                sys.exit(f"Property {label!r} is read-only")
+            if desc.enum_values and value not in desc.enum_values:
+                allowed = ", ".join(str(v) for v in sorted(desc.enum_values))
+                sys.exit(f"Value {value}{unit} not in allowed set: {allowed}")
+            ptp.set_device_prop_value(prop_code, value, desc.data_type)
+            print(f"Set {label} to {value}{unit}")
+
+        ptp.close_session()
+
+    finally:
+        release_interface(dev)
 
 
 def read_all_logs(output_format: str = "gpx", output_dir: str = ".",
@@ -618,17 +795,41 @@ def read_all_logs(output_format: str = "gpx", output_dir: str = ".",
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Read GPS logs from Canon GP-E2")
-    p.add_argument("--format", choices=["gpx", "csv"], default="gpx")
-    p.add_argument("--output-dir", default=".", help="Output directory")
-    p.add_argument("--debug", action="store_true",
-                   help="Add raw hex + mystery bytes (b08, b09, b23-b27) to output")
-    p.add_argument("--overwrite", action="store_true",
-                   help="Overwrite existing output files (default: warn and skip)")
+    p = argparse.ArgumentParser(description="Canon GP-E2 GPS reader")
     p.add_argument("--ignore-version", action="store_true",
                    help="Proceed even if firmware is below tested minimum (2.0.0)")
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    # ── import ────────────────────────────────────────────────────────────────
+    imp = sub.add_parser("import", help="Download GPS logs from device")
+    imp.add_argument("--format", choices=["gpx", "csv"], default="gpx")
+    imp.add_argument("--output-dir", default=".", help="Output directory")
+    imp.add_argument("--debug", action="store_true",
+                     help="Add raw hex + mystery bytes (b08, b09, b23-b27) to output")
+    imp.add_argument("--overwrite", action="store_true",
+                     help="Overwrite existing output files (default: warn and skip)")
+
+    # ── config ────────────────────────────────────────────────────────────────
+    cfg = sub.add_parser("config", help="Read or write device configuration")
+    cfg_sub = cfg.add_subparsers(dest="action", required=True)
+
+    cfg_sub.add_parser("list", help="List all advertised device properties")
+
+    cfg_get = cfg_sub.add_parser("get", help="Read a named property")
+    cfg_get.add_argument("property", choices=list(KNOWN_PROPS))
+
+    cfg_set = cfg_sub.add_parser("set", help="Write a named property")
+    cfg_set.add_argument("property", choices=list(KNOWN_PROPS))
+    cfg_set.add_argument("value", type=int, help="Value to set")
+
     args = p.parse_args()
 
-    read_all_logs(output_format=args.format, output_dir=args.output_dir,
-                  debug=args.debug, overwrite=args.overwrite,
-                  ignore_version=args.ignore_version)
+    if args.mode == "import":
+        read_all_logs(output_format=args.format, output_dir=args.output_dir,
+                      debug=args.debug, overwrite=args.overwrite,
+                      ignore_version=args.ignore_version)
+    elif args.mode == "config":
+        run_config(action=args.action,
+                   prop_name=getattr(args, "property", None),
+                   value=getattr(args, "value", None),
+                   ignore_version=args.ignore_version)
